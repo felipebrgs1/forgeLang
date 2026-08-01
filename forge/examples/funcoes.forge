@@ -1,0 +1,15 @@
+// F2b: funções, variáveis locais e chamadas — executando via LLVM JIT.
+
+func add(a: float, b: float): float {
+    return a + b;
+}
+
+func square(x: float): float {
+    return x * x;
+}
+
+func main(): float {
+    let a = add(2.0, 3.0);
+    let b = square(a);
+    return b;
+}

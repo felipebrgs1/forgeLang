@@ -1,0 +1,26 @@
+// Exemplo: script de cidadão — demonstra a sintaxe A (receiver Go,
+// aparência TS) e o formatter canônico.
+//
+// A gramática atual cobre imports, enums, structs, funcs com receiver,
+// let, return, chamadas e aritmética. `if`/`for`/`==` chegam na F3.
+
+import { City, Vec2 } from "engine";
+
+enum Mood {
+    Happy,
+    Neutral,
+    Stressed,
+}
+
+struct Citizen {
+    home: Vec2;
+    work: Vec2;
+    mood: Mood;
+}
+
+func (c: Citizen) go_home(city: City, dt: float) {
+    let route = city.find_path(c.home, c.work);
+    let first: Vec2 = route.first();
+    let speed = first.length() * dt;
+    return;
+}
