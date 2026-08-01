@@ -174,10 +174,93 @@ impl Formatter {
                 }
                 self.push(";");
             }
+            Stmt::Assign { target, value, .. } => {
+                self.expr(target);
+                self.push(" = ");
+                self.expr(value);
+                self.push(";");
+            }
+            Stmt::If { cond, then_body, else_body, .. } => {
+                self.push("if ");
+                self.expr(cond);
+                self.push(" {");
+                self.with_indent(|w| {
+                    for s in then_body {
+                        w.line();
+                        w.stmt(s);
+                    }
+                });
+                self.line();
+                self.push("}");
+                if let Some(else_body) = else_body {
+                    // `else if` é else_body = [If] — formata em cadeia.
+                    if let [Stmt::If { .. }] = else_body.as_slice() {
+                        self.push(" else ");
+                        self.stmt(&else_body[0]);
+                    } else {
+                        self.push(" else {");
+                        self.with_indent(|w| {
+                            for s in else_body {
+                                w.line();
+                                w.stmt(s);
+                            }
+                        });
+                        self.line();
+                        self.push("}");
+                    }
+                }
+            }
+            Stmt::For { init, cond, post, body, .. } => {
+                self.push("for ");
+                if let Some(init) = init {
+                    self.stmt_head(init.as_ref());
+                    self.push("; ");
+                }
+                if let Some(cond) = cond {
+                    self.expr(cond);
+                    self.push("; ");
+                }
+                if let Some(post) = post {
+                    self.stmt_head(post.as_ref());
+                }
+                self.push(" {");
+                self.with_indent(|w| {
+                    for s in body {
+                        w.line();
+                        w.stmt(s);
+                    }
+                });
+                self.line();
+                self.push("}");
+            }
+            Stmt::Break(_) => self.push("break;"),
+            Stmt::Continue(_) => self.push("continue;"),
             Stmt::Expr(expr) => {
                 self.expr(expr);
                 self.push(";");
             }
+        }
+    }
+
+    /// Statement sem o `;` final — usado no init/post do `for`.
+    fn stmt_head(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Let { name, ty, value, .. } => {
+                self.push("let ");
+                self.push(name);
+                if let Some(ty) = ty {
+                    self.push(&format!(": {}", type_name(ty)));
+                }
+                self.push(" = ");
+                self.expr(value);
+            }
+            Stmt::Assign { target, value, .. } => {
+                self.expr(target);
+                self.push(" = ");
+                self.expr(value);
+            }
+            Stmt::Expr(e) => self.expr(e),
+            other => self.stmt(other),
         }
     }
 
@@ -208,6 +291,22 @@ impl Formatter {
                 self.expr(obj);
                 self.push(&format!(".{field}"));
             }
+            Expr::StructLit { name, fields, .. } => {
+                self.push(name);
+                self.push(" { ");
+                for (i, (fname, value)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        self.push(", ");
+                    }
+                    self.push(&format!("{fname}: "));
+                    self.expr(value);
+                }
+                self.push(" }");
+            }
+            Expr::Unary { op, operand, .. } => {
+                self.push(unary_symbol(*op));
+                self.expr(operand);
+            }
         }
     }
 }
@@ -226,6 +325,21 @@ fn op_symbol(op: BinOp) -> &'static str {
         BinOp::Sub => "-",
         BinOp::Mul => "*",
         BinOp::Div => "/",
+        BinOp::Eq => "==",
+        BinOp::Ne => "!=",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
+        BinOp::And => "&&",
+        BinOp::Or => "||",
+    }
+}
+
+fn unary_symbol(op: UnOp) -> &'static str {
+    match op {
+        UnOp::Neg => "-",
+        UnOp::Not => "!",
     }
 }
 
@@ -273,7 +387,58 @@ mod tests {
                 field: field.clone(),
                 span: s,
             },
+            Expr::StructLit { name, fields, .. } => Expr::StructLit {
+                name: name.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(fname, e)| (fname.clone(), normalize_expr(e)))
+                    .collect(),
+                span: s,
+            },
+            Expr::Unary { op, operand, .. } => Expr::Unary {
+                op: *op,
+                operand: Box::new(normalize_expr(operand)),
+                span: s,
+            },
         }
+    }
+
+    fn normalize_stmt(stmt: &Stmt) -> Stmt {
+        let s = Span::new(0, 0);
+        match stmt {
+            Stmt::Let { name, ty, value, .. } => Stmt::Let {
+                name: name.clone(),
+                ty: ty.clone(),
+                value: normalize_expr(value),
+                span: s,
+            },
+            Stmt::Return(v, _) => Stmt::Return(v.as_ref().map(normalize_expr), s),
+            Stmt::Assign { target, value, .. } => Stmt::Assign {
+                target: normalize_expr(target),
+                value: normalize_expr(value),
+                span: s,
+            },
+            Stmt::If { cond, then_body, else_body, .. } => Stmt::If {
+                cond: normalize_expr(cond),
+                then_body: normalize_stmts(then_body),
+                else_body: else_body.as_ref().map(|b| normalize_stmts(b)),
+                span: s,
+            },
+            Stmt::For { init, cond, post, body, .. } => Stmt::For {
+                init: init.as_ref().map(|i| Box::new(normalize_stmt(i))),
+                cond: cond.as_ref().map(normalize_expr),
+                post: post.as_ref().map(|p| Box::new(normalize_stmt(p))),
+                body: normalize_stmts(body),
+                span: s,
+            },
+            Stmt::Break(_) => Stmt::Break(s),
+            Stmt::Continue(_) => Stmt::Continue(s),
+            Stmt::Expr(e) => Stmt::Expr(normalize_expr(e)),
+        }
+    }
+
+    fn normalize_stmts(stmts: &[Stmt]) -> Vec<Stmt> {
+        stmts.iter().map(normalize_stmt).collect()
     }
 
     fn normalize(p: &Program) -> Program {
@@ -307,20 +472,7 @@ mod tests {
                         name: f.name.clone(),
                         params: f.params.clone(),
                         ret: f.ret.clone(),
-                        body: f
-                            .body
-                            .iter()
-                            .map(|b| match b {
-                                Stmt::Let { name, ty, value, .. } => Stmt::Let {
-                                    name: name.clone(),
-                                    ty: ty.clone(),
-                                    value: normalize_expr(value),
-                                    span: s,
-                                },
-                                Stmt::Return(v, _) => Stmt::Return(v.as_ref().map(normalize_expr), s),
-                                Stmt::Expr(e) => Stmt::Expr(normalize_expr(e)),
-                            })
-                            .collect(),
+                        body: normalize_stmts(&f.body),
                         span: s,
                     }),
                 })
@@ -353,6 +505,35 @@ func (c: C) go(city: City) {
 }
 "#;
         assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn formats_control_flow() {
+        let src = r#"func main(): float {
+if a > b { return 1.0; } else if a == b { return 2.0; } else { return 3.0; }
+for let i = 0.0; i < 5.0; i = i + 1.0 { if i == 2.0 { continue; } break; }
+}"#;
+        let formatted = format_program(&parse_program(src).unwrap());
+        let expected = r#"func main(): float {
+    if a > b {
+        return 1.0;
+    } else if a == b {
+        return 2.0;
+    } else {
+        return 3.0;
+    }
+    for let i = 0.0; i < 5.0; i = i + 1.0 {
+        if i == 2.0 {
+            continue;
+        }
+        break;
+    }
+}
+"#;
+        assert_eq!(formatted, expected);
+        // round-trip: o formato canônico re-parseia igual
+        let reparsed = normalize(&parse_program(&formatted).unwrap());
+        assert_eq!(reparsed, normalize(&parse_program(src).unwrap()));
     }
 
     #[test]

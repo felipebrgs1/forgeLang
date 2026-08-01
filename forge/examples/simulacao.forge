@@ -1,0 +1,51 @@
+// F3: controle de fluxo — if/else, for unificado (Go), comparações.
+// Simulação mínima: uma população onde cada cidadão decide seu mood
+// pela distância de casa, e o jogo conta os estressados.
+
+enum Mood {
+    Happy,
+    Neutral,
+    Stressed,
+}
+
+struct Citizen {
+    home: float;
+    work: float;
+    mood: Mood;
+    stress: float;
+}
+
+func (c: Citizen) update(dt: float) {
+    // decisão por estado: distância casa-trabalho vira estresse
+    let distance = c.work - c.home;
+    if distance < 0.0 {
+        c.stress = -distance * dt;
+    } else {
+        c.stress = distance * dt;
+    }
+    if c.stress > 3.0 {
+        c.mood = Mood.Stressed;
+    } else if c.stress > 1.0 {
+        c.mood = Mood.Neutral;
+    } else {
+        c.mood = Mood.Happy;
+    }
+}
+
+func simulate(citizens: float): float {
+    let stressed = 0.0;
+    let total = 0.0;
+    for let i = 0.0; i < citizens; i = i + 1.0 {
+        let c = Citizen { home: i * 2.0, work: i * 1.0, mood: Mood.Happy, stress: 0.0 };
+        c.update(1.0);
+        total = total + 1.0;
+        if c.mood == Mood.Stressed {
+            stressed = stressed + 1.0;
+        }
+    }
+    return stressed / total * 100.0;
+}
+
+func main(): float {
+    return simulate(10.0);
+}

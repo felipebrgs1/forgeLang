@@ -1,8 +1,6 @@
-// Exemplo: script de cidadão — demonstra a sintaxe A (receiver Go,
-// aparência TS) e o formatter canônico.
-//
-// A gramática atual cobre imports, enums, structs, funcs com receiver,
-// let, return, chamadas e aritmética. `if`/`for`/`==` chegam na F3.
+// F2d: structs aninhadas, enums e atribuição — o cidadão "vivo".
+// O import da engine é ignorado no codegen até a F6 (FFI);
+// Vec2 é declarado localmente como stub.
 
 import { City, Vec2 } from "engine";
 
@@ -12,15 +10,36 @@ enum Mood {
     Stressed,
 }
 
+struct Vec2 {
+    x: float;
+    y: float;
+}
+
 struct Citizen {
     home: Vec2;
     work: Vec2;
+    pos: Vec2;
     mood: Mood;
 }
 
-func (c: Citizen) go_home(city: City, dt: float) {
-    let route = city.find_path(c.home, c.work);
-    let first: Vec2 = route.first();
-    let speed = first.length() * dt;
-    return;
+func (c: Citizen) go_home(dt: float) {
+    c.pos.x = c.pos.x + (c.home.x - c.pos.x) * dt;
+    c.pos.y = c.pos.y + (c.home.y - c.pos.y) * dt;
+}
+
+func (c: Citizen) go_work(dt: float) {
+    c.pos.x = c.pos.x + (c.work.x - c.pos.x) * dt;
+    c.pos.y = c.pos.y + (c.work.y - c.pos.y) * dt;
+}
+
+func (c: Citizen) set_mood(m: Mood) {
+    c.mood = m;
+}
+
+func main(): float {
+    let c = Citizen { home: Vec2 { x: 100.0, y: 0.0 }, work: Vec2 { x: 0.0, y: 100.0 }, pos: Vec2 { x: 0.0, y: 0.0 }, mood: Mood.Happy };
+    c.go_home(0.5);
+    c.set_mood(Mood.Stressed);
+    c.go_work(0.5);
+    return c.pos.x + c.pos.y;
 }

@@ -1,0 +1,26 @@
+// F2c: structs, receiver (Go) e member access — executando via LLVM.
+
+struct Point {
+    x: float;
+    y: float;
+}
+
+func (p: Point) len_sq(): float {
+    return p.x * p.x + p.y * p.y;
+}
+
+func (p: Point) dist(q: Point): float {
+    let dx = p.x - q.x;
+    let dy = p.y - q.y;
+    return dx * dx + dy * dy;
+}
+
+func make_point(x: float, y: float): Point {
+    return Point { x: x, y: y };
+}
+
+func main(): float {
+    let a = make_point(3.0, 4.0);
+    let b = Point { x: 0.0, y: 0.0 };
+    return a.len_sq() + b.dist(a);
+}

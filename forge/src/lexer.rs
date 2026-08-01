@@ -10,6 +10,12 @@ pub enum Keyword {
     Import,
     From,
     Return,
+    If,
+    Else,
+    For,
+    In,
+    Break,
+    Continue,
 }
 
 impl Keyword {
@@ -22,6 +28,12 @@ impl Keyword {
             "import" => Keyword::Import,
             "from" => Keyword::From,
             "return" => Keyword::Return,
+            "if" => Keyword::If,
+            "else" => Keyword::Else,
+            "for" => Keyword::For,
+            "in" => Keyword::In,
+            "break" => Keyword::Break,
+            "continue" => Keyword::Continue,
             _ => return None,
         })
     }
@@ -53,6 +65,15 @@ pub enum TokenKind {
     Star,
     Slash,
     Eq,
+    EqEq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    AndAnd,
+    OrOr,
+    Bang,
     LParen,
     RParen,
     LBrace,
@@ -146,9 +167,78 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                 col += 1;
             }
             '=' => {
-                push!(TokenKind::Eq, span);
-                i += 1;
-                col += 1;
+                // '=' ou '=='
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    push!(TokenKind::EqEq, span);
+                    i += 2;
+                    col += 2;
+                } else {
+                    push!(TokenKind::Eq, span);
+                    i += 1;
+                    col += 1;
+                }
+            }
+            '!' => {
+                // '!' ou '!='
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    push!(TokenKind::Ne, span);
+                    i += 2;
+                    col += 2;
+                } else {
+                    push!(TokenKind::Bang, span);
+                    i += 1;
+                    col += 1;
+                }
+            }
+            '<' => {
+                // '<' ou '<='
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    push!(TokenKind::Le, span);
+                    i += 2;
+                    col += 2;
+                } else {
+                    push!(TokenKind::Lt, span);
+                    i += 1;
+                    col += 1;
+                }
+            }
+            '>' => {
+                // '>' ou '>='
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    push!(TokenKind::Ge, span);
+                    i += 2;
+                    col += 2;
+                } else {
+                    push!(TokenKind::Gt, span);
+                    i += 1;
+                    col += 1;
+                }
+            }
+            '&' => {
+                // '&&' (e sozinho não existe)
+                if i + 1 < chars.len() && chars[i + 1] == '&' {
+                    push!(TokenKind::AndAnd, span);
+                    i += 2;
+                    col += 2;
+                } else {
+                    return Err(LexError {
+                        msg: "esperava '&&'".into(),
+                        span,
+                    });
+                }
+            }
+            '|' => {
+                // '||' (e sozinho não existe)
+                if i + 1 < chars.len() && chars[i + 1] == '|' {
+                    push!(TokenKind::OrOr, span);
+                    i += 2;
+                    col += 2;
+                } else {
+                    return Err(LexError {
+                        msg: "esperava '||'".into(),
+                        span,
+                    });
+                }
             }
             '(' => {
                 push!(TokenKind::LParen, span);

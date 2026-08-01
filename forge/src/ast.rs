@@ -102,6 +102,36 @@ pub enum Stmt {
     },
     /// `return expr;`
     Return(Option<Expr>, Span),
+    /// Atribuição: `alvo = valor;` (alvo é lvalue: variável ou campo)
+    Assign {
+        target: Expr,
+        value: Expr,
+        span: Span,
+    },
+    /// `if cond { ... } else { ... }` (else é opcional; `else if` vira
+    /// else_body = [If {...}]).
+    If {
+        cond: Expr,
+        then_body: Vec<Stmt>,
+        else_body: Option<Vec<Stmt>>,
+        span: Span,
+    },
+    /// `for` unificado (Go):
+    ///   for {}                     — infinito
+    ///   for cond {}                — enquanto
+    ///   for init; cond; post {}    — contador
+    ///   for x in xs {}             — iteração (requer arrays: F5)
+    For {
+        init: Option<Box<Stmt>>,
+        cond: Option<Expr>,
+        post: Option<Box<Stmt>>,
+        body: Vec<Stmt>,
+        span: Span,
+    },
+    /// `break;` — sai do loop mais interno.
+    Break(Span),
+    /// `continue;` — pula para a próxima iteração.
+    Continue(Span),
     /// Qualquer expressão como statement (chamadas, etc.)
     Expr(Expr),
 }
@@ -114,6 +144,22 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnOp {
+    /// `-x`
+    Neg,
+    /// `!x`
+    Not,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +185,18 @@ pub enum Expr {
         field: String,
         span: Span,
     },
+    /// Literal de struct: `Point { x: 1.0, y: 2.0 }`
+    StructLit {
+        name: String,
+        fields: Vec<(String, Expr)>,
+        span: Span,
+    },
+    /// Operação unária: `-x`, `!x`
+    Unary {
+        op: UnOp,
+        operand: Box<Expr>,
+        span: Span,
+    },
 }
 
 // `Expr::span` será usado pelo codegen/erros nas próximas fases.
@@ -151,7 +209,9 @@ impl Expr {
             | Expr::Ident(_, s) => *s,
             Expr::Binary { span, .. }
             | Expr::Call { span, .. }
-            | Expr::Member { span, .. } => *span,
+            | Expr::Member { span, .. }
+            | Expr::StructLit { span, .. }
+            | Expr::Unary { span, .. } => *span,
         }
     }
 }

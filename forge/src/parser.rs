@@ -258,10 +258,155 @@ impl Parser {
             self.parse_let()
         } else if self.at_keyword(Keyword::Return) {
             self.parse_return()
+        } else if self.at_keyword(Keyword::If) {
+            self.parse_if()
+        } else if self.at_keyword(Keyword::For) {
+            self.parse_for()
+        } else if self.at_keyword(Keyword::Break) {
+            let span = self.advance().span;
+            self.expect(&TokenKind::Semicolon)?;
+            Ok(Stmt::Break(span))
+        } else if self.at_keyword(Keyword::Continue) {
+            let span = self.advance().span;
+            self.expect(&TokenKind::Semicolon)?;
+            Ok(Stmt::Continue(span))
         } else {
             let expr = self.parse_expr()?;
+            if self.peek_kind() == &TokenKind::Eq {
+                // atribuição: expr '=' expr ';'
+                let span = self.advance().span;
+                let value = self.parse_expr()?;
+                self.expect(&TokenKind::Semicolon)?;
+                Ok(Stmt::Assign { target: expr, value, span })
+            } else {
+                self.expect(&TokenKind::Semicolon)?;
+                Ok(Stmt::Expr(expr))
+            }
+        }
+    }
+
+    /// `if cond { } else { }` — `else if` vira else_body = [If].
+    fn parse_if(&mut self) -> Result<Stmt, ParseError> {
+        let span = self.expect_keyword(Keyword::If)?;
+        let cond = self.parse_expr()?;
+        let then_body = self.parse_block()?;
+        let else_body = if self.at_keyword(Keyword::Else) {
+            self.advance();
+            if self.at_keyword(Keyword::If) {
+                Some(vec![self.parse_if()?])
+            } else {
+                Some(self.parse_block()?)
+            }
+        } else {
+            None
+        };
+        Ok(Stmt::If { cond, then_body, else_body, span })
+    }
+
+    /// `for` unificado. As formas são distinguidas por lookahead:
+    ///   for { }                 → infinito
+    ///   for let i = 0.0; ...    → contador (init statement)
+    ///   for i = 0.0; ...        → contador (init expr)
+    ///   for cond { }            → enquanto
+    ///   for x in xs { }         → iteração (parse; codegen exige arrays: F5)
+    fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+        let span = self.expect_keyword(Keyword::For)?;
+
+        // for { } — infinito
+        if self.peek_kind() == &TokenKind::LBrace {
+            let body = self.parse_block()?;
+            return Ok(Stmt::For { init: None, cond: None, post: None, body, span });
+        }
+
+        // for x in xs { } — iteração (detectada por Ident + keyword `in`)
+        if matches!(self.peek_kind(), TokenKind::Ident(_))
+            && matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::Keyword(Keyword::In)))
+        {
+            self.advance(); // ident
+            self.advance(); // in
+            let _iterable = self.parse_expr()?;
+            let _body = self.parse_block()?;
+            return Err(ParseError {
+                msg: "iteração 'for x in xs' requer arrays — chega na F5".into(),
+                span,
+            });
+        }
+
+        // for let i = 0.0; cond; post { } — contador com init let
+        if self.at_keyword(Keyword::Let) {
+            let init = self.parse_let()?;
+            let cond = if self.peek_kind() == &TokenKind::Semicolon {
+                self.advance();
+                None
+            } else {
+                let c = self.parse_expr()?;
+                self.expect(&TokenKind::Semicolon)?;
+                Some(c)
+            };
+            let post = self.parse_for_post()?;
+            let body = self.parse_block()?;
+            return Ok(Stmt::For {
+                init: Some(Box::new(init)),
+                cond,
+                post,
+                body,
+                span,
+            });
+        }
+
+        // Decide a forma pelo delimitador após a primeira expressão:
+        //   expr { }  → for cond (enquanto)
+        //   expr ;    → contador (init)
+        let first = self.parse_expr()?;
+        if self.peek_kind() == &TokenKind::LBrace {
+            let body = self.parse_block()?;
+            return Ok(Stmt::For {
+                init: None,
+                cond: Some(first),
+                post: None,
+                body,
+                span,
+            });
+        }
+        self.expect(&TokenKind::Semicolon)?;
+
+        // cond: expr, terminado por ';' (vazio = sempre verdadeiro)
+        let cond = if self.peek_kind() == &TokenKind::Semicolon {
+            self.advance();
+            None
+        } else {
+            let c = self.parse_expr()?;
             self.expect(&TokenKind::Semicolon)?;
-            Ok(Stmt::Expr(expr))
+            Some(c)
+        };
+
+        let post = self.parse_for_post()?;
+        let body = self.parse_block()?;
+        Ok(Stmt::For {
+            init: Some(Box::new(Stmt::Expr(first))),
+            cond,
+            post,
+            body,
+            span,
+        })
+    }
+
+    /// Post de um for contador: statement sem `;` final
+    /// (geralmente atribuição) ou nada se `{` já chegou.
+    fn parse_for_post(&mut self) -> Result<Option<Box<Stmt>>, ParseError> {
+        if self.peek_kind() == &TokenKind::LBrace {
+            return Ok(None);
+        }
+        if self.at_keyword(Keyword::Let) {
+            return Ok(Some(Box::new(self.parse_let()?)));
+        }
+        let e = self.parse_expr()?;
+        if self.peek_kind() == &TokenKind::Eq {
+            let span = self.advance().span;
+            let v = self.parse_expr()?;
+            Ok(Some(Box::new(Stmt::Assign { target: e, value: v, span })))
+        } else {
+            Ok(Some(Box::new(Stmt::Expr(e))))
         }
     }
 
@@ -306,7 +451,59 @@ impl Parser {
 
     /// Expressão no topo (usada pelo CLI/JIT e por statements).
     pub fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_additive()
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_and()?;
+        while self.peek_kind() == &TokenKind::OrOr {
+            let span = self.advance().span;
+            let rhs = self.parse_and()?;
+            lhs = Expr::Binary { op: BinOp::Or, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_equality()?;
+        while self.peek_kind() == &TokenKind::AndAnd {
+            let span = self.advance().span;
+            let rhs = self.parse_equality()?;
+            lhs = Expr::Binary { op: BinOp::And, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_equality(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_relational()?;
+        loop {
+            let op = match self.peek_kind() {
+                TokenKind::EqEq => BinOp::Eq,
+                TokenKind::Ne => BinOp::Ne,
+                _ => break,
+            };
+            let span = self.advance().span;
+            let rhs = self.parse_relational()?;
+            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_relational(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_additive()?;
+        loop {
+            let op = match self.peek_kind() {
+                TokenKind::Lt => BinOp::Lt,
+                TokenKind::Le => BinOp::Le,
+                TokenKind::Gt => BinOp::Gt,
+                TokenKind::Ge => BinOp::Ge,
+                _ => break,
+            };
+            let span = self.advance().span;
+            let rhs = self.parse_additive()?;
+            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+        }
+        Ok(lhs)
     }
 
     fn parse_additive(&mut self) -> Result<Expr, ParseError> {
@@ -325,7 +522,7 @@ impl Parser {
     }
 
     fn parse_multiplicative(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_postfix()?;
+        let mut lhs = self.parse_unary()?;
         loop {
             let op = match self.peek_kind() {
                 TokenKind::Star => BinOp::Mul,
@@ -333,10 +530,23 @@ impl Parser {
                 _ => break,
             };
             let span = self.advance().span;
-            let rhs = self.parse_postfix()?;
+            let rhs = self.parse_unary()?;
             lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
         }
         Ok(lhs)
+    }
+
+    /// Unário: `-x`, `!x`, encadeável (`--x` para números negativos).
+    fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        let tok = self.peek().clone();
+        let op = match tok.kind {
+            TokenKind::Minus => UnOp::Neg,
+            TokenKind::Bang => UnOp::Not,
+            _ => return self.parse_postfix(),
+        };
+        self.advance();
+        let operand = self.parse_unary()?;
+        Ok(Expr::Unary { op, operand: Box::new(operand), span: tok.span })
     }
 
     /// Pós-fixo: chamadas e acesso a membro ligam mais forte que binários.
@@ -350,7 +560,7 @@ impl Parser {
                     let mut args = Vec::new();
                     if self.peek_kind() != &TokenKind::RParen {
                         loop {
-                            args.push(self.parse_additive()?);
+                            args.push(self.parse_or()?);
                             if self.peek_kind() == &TokenKind::Comma {
                                 self.advance();
                             } else {
@@ -385,11 +595,34 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.advance();
-                Ok(Expr::Ident(name, tok.span))
+                // `Point { x: 1.0 }` — literal de struct. Só quando o
+                // padrão Ident { Ident : — senão `a {` é bloco de if/for.
+                let is_struct_lit = matches!(self.peek_kind(), TokenKind::LBrace)
+                    && matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::Ident(_)))
+                    && matches!(self.tokens.get(self.pos + 2).map(|t| &t.kind), Some(TokenKind::Colon));
+                if is_struct_lit {
+                    self.advance(); // {
+                    let mut fields = Vec::new();
+                    while self.peek_kind() != &TokenKind::RBrace {
+                        let (fname, _) = self.expect_ident()?;
+                        self.expect(&TokenKind::Colon)?;
+                        let value = self.parse_or()?;
+                        fields.push((fname, value));
+                        if self.peek_kind() == &TokenKind::Comma {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(&TokenKind::RBrace)?;
+                    Ok(Expr::StructLit { name, fields, span: tok.span })
+                } else {
+                    Ok(Expr::Ident(name, tok.span))
+                }
             }
             TokenKind::LParen => {
                 self.advance();
-                let inner = self.parse_additive()?;
+                let inner = self.parse_or()?;
                 self.expect(&TokenKind::RParen)?;
                 Ok(inner)
             }
@@ -433,6 +666,11 @@ mod tests {
                 }
             }
             Expr::Member { obj, .. } => ops_in(obj, out),
+            Expr::StructLit { fields, .. } => {
+                for (_, e) in fields {
+                    ops_in(e, out);
+                }
+            }
             _ => {}
         }
     }

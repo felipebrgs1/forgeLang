@@ -68,10 +68,19 @@ Cada fase termina com algo testável. Nunca avance sem testes verdes.
 - [x] **F2b — Funções e variáveis executáveis**: codegen de `let` (Alloca/Load/Store),
       funções com forward references, chamadas, `return`, `main` como entry
       (12 testes novos; `forge run <arquivo>` executa via JIT)
-- [ ] **F2c — Structs, receiver e member access**: tipos LLVM agregados, GEP,
-      métodos (`Citizen.go` → param 0), `a.b()` resolvendo pelo tipo
-- [ ] **F3 — Controle de fluxo**: `if/else`, `for` unificado (Go — **sem `while`**,
-      `for cond` cobre), comparações (basic blocks + PHI nodes)
+- [x] **F2c — Structs, receiver e member access**: tipos LLVM agregados + GEP,
+      métodos (`Point.len_sq` → receiver = param 0), `a.b()` resolvendo pelo tipo,
+      struct literals `Point { x: 1.0, y: 2.0 }`, structs por valor (4 testes novos)
+- [x] **F2d — Structs aninhadas, enums e atribuição**: campos de struct em struct
+      (GEP encadeado), enums como valores (`Mood.Stressed`), atribuição com
+      lvalue (`c.pos.x = ...`), receiver por REFERÊNCIA (métodos mutam o
+      original), detecção de ciclo de struct; `citizen.forge` roda de ponta
+      a ponta (6 testes novos)
+- [x] **F3 — Controle de fluxo**: `if/else` (incl. `else if` em cadeia), `for` unificado
+      (Go — `for`, `for cond`, `for init; cond; post`, sem `while`), `break`/`continue`,
+      comparações (`== != < <= > >=`), lógicos (`&& || !`), unário `-`,
+      tipo `bool` (i1), loops aninhados (15 testes novos);
+      `examples/simulacao.forge` — população que decide mood e conta estressados
 - [ ] **F4 — Type checker + strings**: primitivos `int`/`float`/`bool`/`string`/`void`,
       literais `true`/`false`, int e float separados (Go), divisão de int trunca,
       coerção assimétrica (`int→float` automática, `float→int` só via cast),
