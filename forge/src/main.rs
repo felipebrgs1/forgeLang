@@ -9,12 +9,13 @@
 //!   forge ast <arquivo.forge>  → dump da AST (debug do parser)
 
 mod ast;
+mod checker;
 mod codegen;
 mod formatter;
 mod lexer;
 mod parser;
 
-use codegen::Codegen;
+use codegen::MainResult;
 use inkwell::context::Context;
 
 fn main() {
@@ -49,16 +50,17 @@ fn help() -> ! {
     std::process::exit(1);
 }
 
-/// Caminho F1: expressão pura → JIT.
+/// Caminho F1: expressão pura → type check → JIT.
 fn run_expr(src: &str) -> Result<f64, String> {
     let expr = parser::parse_expr(src).map_err(|e| e.to_string())?;
+    let expr = checker::check_expr(&expr).map_err(|e| e.to_string())?;
     let context = Context::create();
-    let mut cg = Codegen::new(&context);
+    let mut cg = codegen::Codegen::new(&context);
     cg.compile_top(&expr)?;
     cg.run_jit()
 }
 
-/// `forge run <file>`: parseia o programa e executa `main` via JIT.
+/// `forge run <file>`: parseia, verifica tipos e executa `main` via JIT.
 fn run_file(path: &str) {
     let src = std::fs::read_to_string(path)
         .unwrap_or_else(|e| die(&format!("não consegui ler '{path}': {e}")));
@@ -66,14 +68,19 @@ fn run_file(path: &str) {
         Ok(p) => p,
         Err(e) => die(&e.to_string()),
     };
+    let program = match checker::check_program(&program) {
+        Ok(p) => p,
+        Err(e) => die(&e.to_string()),
+    };
     let context = Context::create();
-    let mut cg = Codegen::new(&context);
+    let mut cg = codegen::Codegen::new(&context);
     if let Err(e) = cg.compile_program(&program) {
         die(&e);
     }
     match cg.run_main() {
-        Ok(Some(v)) => println!("main() = {v}"),
-        Ok(None) => println!("main() executada (void)"),
+        Ok(MainResult::Float(v)) => println!("main() = {v}"),
+        Ok(MainResult::Int(v)) => println!("main() = {v}"),
+        Ok(MainResult::Void) => println!("main() executada (void)"),
         Err(e) => die(&e),
     }
 }

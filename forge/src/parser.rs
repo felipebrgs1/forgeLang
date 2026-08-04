@@ -444,7 +444,14 @@ impl Parser {
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
         let (name, _) = self.expect_ident()?;
-        Ok(Type::Named(name))
+        Ok(match name.as_str() {
+            "int" => Type::Int,
+            "float" => Type::Float,
+            "bool" => Type::Bool,
+            "string" => Type::Str,
+            "void" => Type::Void,
+            _ => Type::Named(name),
+        })
     }
 
     // --------------------- expressões ---------------------------------
@@ -585,9 +592,13 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         let tok = self.peek().clone();
         match tok.kind {
-            TokenKind::Number(n) => {
+            TokenKind::IntLit(n) => {
                 self.advance();
-                Ok(Expr::Number(n, tok.span))
+                Ok(Expr::Int(n, tok.span))
+            }
+            TokenKind::FloatLit(n) => {
+                self.advance();
+                Ok(Expr::Float(n, tok.span))
             }
             TokenKind::StrLit(s) => {
                 self.advance();
@@ -595,6 +606,13 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.advance();
+                // true/false: predeclarados, estilo Go (não são keywords).
+                if name == "true" {
+                    return Ok(Expr::Bool(true, tok.span));
+                }
+                if name == "false" {
+                    return Ok(Expr::Bool(false, tok.span));
+                }
                 // `Point { x: 1.0 }` — literal de struct. Só quando o
                 // padrão Ident { Ident : — senão `a {` é bloco de if/for.
                 let is_struct_lit = matches!(self.peek_kind(), TokenKind::LBrace)

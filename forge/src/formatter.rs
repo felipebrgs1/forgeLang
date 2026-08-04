@@ -268,7 +268,9 @@ impl Formatter {
 
     fn expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Number(n, _) => self.push(&format_number(*n)),
+            Expr::Int(n, _) => self.push(&n.to_string()),
+            Expr::Float(n, _) => self.push(&format_number(*n)),
+            Expr::Bool(b, _) => self.push(if *b { "true" } else { "false" }),
             Expr::Str(s, _) => self.push(&format!("\"{s}\"")),
             Expr::Ident(name, _) => self.push(name),
             Expr::Binary { op, lhs, rhs, .. } => {
@@ -307,17 +309,18 @@ impl Formatter {
                 self.push(unary_symbol(*op));
                 self.expr(operand);
             }
+            Expr::Cast { to, expr, .. } => {
+                // Cast explícito imprime como chamada: int(x), float(x).
+                self.push(type_name(to).as_str());
+                self.push("(");
+                self.expr(expr);
+                self.push(")");
+            }
         }
     }
 }
 
 // ============================ helpers ================================
-
-fn type_name(ty: &Type) -> String {
-    match ty {
-        Type::Named(name) => name.clone(),
-    }
-}
 
 fn op_symbol(op: BinOp) -> &'static str {
     match op {
@@ -368,7 +371,9 @@ mod tests {
     fn normalize_expr(e: &Expr) -> Expr {
         let s = Span::new(0, 0);
         match e {
-            Expr::Number(n, _) => Expr::Number(*n, s),
+            Expr::Int(n, _) => Expr::Int(*n, s),
+            Expr::Float(n, _) => Expr::Float(*n, s),
+            Expr::Bool(b, _) => Expr::Bool(*b, s),
             Expr::Str(x, _) => Expr::Str(x.clone(), s),
             Expr::Ident(x, _) => Expr::Ident(x.clone(), s),
             Expr::Binary { op, lhs, rhs, .. } => Expr::Binary {
@@ -398,6 +403,11 @@ mod tests {
             Expr::Unary { op, operand, .. } => Expr::Unary {
                 op: *op,
                 operand: Box::new(normalize_expr(operand)),
+                span: s,
+            },
+            Expr::Cast { to, expr, .. } => Expr::Cast {
+                to: to.clone(),
+                expr: Box::new(normalize_expr(expr)),
                 span: s,
             },
         }
@@ -485,7 +495,7 @@ mod tests {
         let src = r#"import { City } from "engine";
 enum Mood { Happy, Neutral }
 struct C { x: float; }
-func (c: C) go(city: City) { let a: float = 1; c.move(city, a); }"#;
+func (c: C) go(city: City) { let a: float = 1.0; c.move(city, a); }"#;
         let program = parse_program(src).unwrap();
         let formatted = format_program(&program);
         let expected = r#"import { City } from "engine";
@@ -534,6 +544,14 @@ for let i = 0.0; i < 5.0; i = i + 1.0 { if i == 2.0 { continue; } break; }
         // round-trip: o formato canônico re-parseia igual
         let reparsed = normalize(&parse_program(&formatted).unwrap());
         assert_eq!(reparsed, normalize(&parse_program(src).unwrap()));
+    }
+
+    #[test]
+    fn formats_int_bool_and_string_literals() {
+        let src = "func main() { let a = 42; let b = 3.14; let c = true; let d = \"oi\"; }\n";
+        let formatted = format_program(&parse_program(src).unwrap());
+        let expected = "func main() {\n    let a = 42;\n    let b = 3.14;\n    let c = true;\n    let d = \"oi\";\n}\n";
+        assert_eq!(formatted, expected);
     }
 
     #[test]

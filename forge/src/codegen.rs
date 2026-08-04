@@ -1,12 +1,16 @@
-//! Codegen: AST → LLVM IR, e execução via JIT.
+//! Codegen: AST verificado → LLVM IR, e execução via JIT.
 //!
 //! F1:  expressão única → função `top()` → JIT
 //! F2b: programa inteiro → funções, variáveis, chamadas, `main`
 //! F2c: structs (LLVM agregados + GEP), receiver como param 0,
 //!      member access (`p.x`) e chamadas de método (`p.len_sq()`)
+//! F4:  int (i64) e float (f64) separados, bool (i1), strings internadas
+//!      (global única por conteúdo — ==/!= vira comparação de ponteiro),
+//!      casts inseridos pelo type checker (`Cast`)
 //!
-//! Um mini type-check vive aqui (tipo de cada expressão) até o type
-//! checker real da F4. Tipos hoje: `float` e structs de campos float.
+//! Entrada: o AST já verificado pelo type checker (F4) — os tipos estão
+//! coerentes (casts implícitos inseridos) e os erros de tipo já foram
+//! reportados. As verificações restantes aqui são defensivas.
 
 use crate::ast::*;
 use inkwell::basic_block::BasicBlock;
@@ -18,11 +22,18 @@ use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FloatValue, FunctionValue, IntValue, PointerValue,
 };
-use inkwell::{FloatPredicate, OptimizationLevel};
+use inkwell::{FloatPredicate, IntPredicate, OptimizationLevel};
 use std::collections::HashMap;
 
 /// Assinatura da função top-level do caminho F1 (expressão).
 pub type TopFn = unsafe extern "C" fn() -> f64;
+
+/// Resultado da execução de `main`.
+pub enum MainResult {
+    Float(f64),
+    Int(i64),
+    Void,
+}
 
 /// Definição de struct resolvida: campos na ordem declarada.
 struct StructDef {
@@ -52,8 +63,11 @@ pub struct Codegen<'ctx> {
     /// Structs declaradas: nome → (tipo LLVM, definição).
     structs: HashMap<String, (StructType<'ctx>, StructDef)>,
     /// Enums declarados: nome → variante → valor (sequencial desde 0).
-    /// Internamente são floats (F4 troca por tipos reais).
-    enums: HashMap<String, HashMap<String, f64>>,
+    /// Internamente são i64 (F4).
+    enums: HashMap<String, HashMap<String, i64>>,
+    /// Strings internadas: conteúdo → global constante (uma por string
+    /// única — ==/!= vira comparação de ponteiro).
+    strings: HashMap<String, PointerValue<'ctx>>,
     /// Tipo de retorno da função sendo gerada (None = void).
     current_ret: Option<Type>,
     /// Função sendo gerada (para criar basic blocks).
@@ -76,6 +90,7 @@ impl<'ctx> Codegen<'ctx> {
             vars: HashMap::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
+            strings: HashMap::new(),
             current_ret: None,
             current_fn: None,
             block_open: true,
@@ -85,40 +100,53 @@ impl<'ctx> Codegen<'ctx> {
 
     // ======================= tipos e helpers =========================
 
-    fn type_name(ty: &Type) -> String {
-        match ty {
-            Type::Named(name) => name.clone(),
-        }
+    fn is_float(ty: &Type) -> bool {
+        matches!(ty, Type::Float)
     }
 
-    fn is_float(ty: &Type) -> bool {
-        matches!(ty, Type::Named(n) if n == "float")
+    fn is_int(ty: &Type) -> bool {
+        matches!(ty, Type::Int)
     }
 
     /// Tipo LLVM correspondente a um tipo da linguagem.
     fn llvm_type(&self, ty: &Type) -> Result<BasicTypeEnum<'ctx>, String> {
         match ty {
-            // enums são floats internamente até a F4
-            Type::Named(n) if n == "float" || self.enums.contains_key(n) => {
-                Ok(self.context.f64_type().into())
-            }
-            Type::Named(n) if n == "bool" => Ok(self.context.bool_type().into()),
+            Type::Float => Ok(self.context.f64_type().into()),
+            Type::Int => Ok(self.context.i64_type().into()),
+            Type::Bool => Ok(self.context.bool_type().into()),
+            // string = ponteiro para global interna (F4).
+            Type::Str => Ok(self.context.ptr_type(inkwell::AddressSpace::default()).into()),
+            // enums são i64 internamente (F4).
+            Type::Named(n) if self.enums.contains_key(n) => Ok(self.context.i64_type().into()),
             Type::Named(n) => self
                 .structs
                 .get(n)
                 .map(|(st, _)| (*st).into())
                 .ok_or_else(|| format!("tipo '{n}' desconhecido (struct não declarada ou tipo não suportado)")),
+            Type::Void => Err("tipo 'void' não é um valor".into()),
         }
     }
 
-    /// Extrai FloatValue, com erro claro se o tipo não é numérico
-    /// (float ou enum — enums são f64 internamente até a F4).
+    /// Extrai FloatValue, com erro claro se o tipo não é float.
     fn as_float(&self, t: &Typed<'ctx>, what: &str) -> Result<FloatValue<'ctx>, String> {
-        let tn = Self::type_name(&t.ty);
-        if !(Self::is_float(&t.ty) || self.enums.contains_key(&tn)) {
-            return Err(format!("'{what}' deve ser numérico, encontrou '{tn}'"));
+        if !Self::is_float(&t.ty) {
+            return Err(format!(
+                "'{what}' deve ser float, encontrou '{}'",
+                type_name(&t.ty)
+            ));
         }
         Ok(t.value.into_float_value())
+    }
+
+    /// Extrai IntValue (i64) de um int/enum, com erro claro.
+    fn as_int(&self, t: &Typed<'ctx>, what: &str) -> Result<IntValue<'ctx>, String> {
+        if !Self::is_int(&t.ty) && !self.enums.contains_key(&type_name(&t.ty)) {
+            return Err(format!(
+                "'{what}' deve ser int, encontrou '{}'",
+                type_name(&t.ty)
+            ));
+        }
+        Ok(t.value.into_int_value())
     }
 
     // ========================= F2c: programa ==========================
@@ -140,13 +168,14 @@ impl<'ctx> Codegen<'ctx> {
         Ok(())
     }
 
-    /// Passo 0: enums viram mapas de constantes (valores 0, 1, 2...).
+    /// Passo 0: enums viram mapas de constantes (valores 0, 1, 2...
+    /// como i64 — F4 trocou o float interno por int real).
     fn declare_enums(&mut self, program: &Program) -> Result<(), String> {
         for decl in &program.decls {
             if let Decl::Enum(e) = decl {
                 let mut variants = HashMap::new();
                 for (i, v) in e.variants.iter().enumerate() {
-                    variants.insert(v.clone(), i as f64);
+                    variants.insert(v.clone(), i as i64);
                 }
                 self.enums.insert(e.name.clone(), variants);
             }
@@ -167,13 +196,18 @@ impl<'ctx> Codegen<'ctx> {
                 raw.insert(s.name.clone(), fields);
             }
         }
-        // 2. Valida: cada campo é float | enum | struct declarada.
+        // 2. Valida: cada campo é primitivo | enum | struct declarada.
         for (name, fields) in &raw {
             for (fname, ty) in fields {
-                let tn = Self::type_name(ty);
-                if !(Self::is_float(ty) || self.enums.contains_key(&tn) || raw.contains_key(&tn)) {
+                let valid = match ty {
+                    Type::Int | Type::Float | Type::Bool | Type::Str => true,
+                    Type::Named(n) => self.enums.contains_key(n) || raw.contains_key(n),
+                    _ => false,
+                };
+                if !valid {
                     return Err(format!(
-                        "struct '{name}': campo '{fname}' de tipo '{tn}' desconhecido"
+                        "struct '{name}': campo '{fname}' de tipo '{}' desconhecido",
+                        type_name(ty)
                     ));
                 }
             }
@@ -220,7 +254,7 @@ impl<'ctx> Codegen<'ctx> {
         let fields = raw.get(start)?;
         path.push(start.to_string());
         for (_, ty) in fields {
-            let tn = Self::type_name(ty);
+            let tn = type_name(ty);
             if raw.contains_key(&tn) {
                 if let Some(cycle) = Self::struct_cycle(raw, &tn, path) {
                     return Some(cycle);
@@ -235,7 +269,7 @@ impl<'ctx> Codegen<'ctx> {
     /// tipo para evitar colisão: `Point.len_sq`.
     fn func_symbol(f: &FuncDecl) -> String {
         match &f.receiver {
-            Some(r) => format!("{}.{}", Self::type_name(&r.ty), f.name),
+            Some(r) => format!("{}.{}", type_name(&r.ty), f.name),
             None => f.name.clone(),
         }
     }
@@ -318,11 +352,15 @@ impl<'ctx> Codegen<'ctx> {
             self.gen_stmt(stmt)?;
         }
 
-        // Retorno implícito: 0.0 para float, void caso contrário.
+        // Retorno implícito: 0 para int/float, void caso contrário.
         if self.block_open {
             match &f.ret {
                 Some(t) if Self::is_float(t) => {
                     let zero = self.context.f64_type().const_float(0.0);
+                    self.builder.build_return(Some(&zero)).map_err(|e| e.to_string())?;
+                }
+                Some(t) if Self::is_int(t) => {
+                    let zero = self.context.i64_type().const_zero();
                     self.builder.build_return(Some(&zero)).map_err(|e| e.to_string())?;
                 }
                 Some(_) => {
@@ -359,11 +397,11 @@ impl<'ctx> Codegen<'ctx> {
             Stmt::Let { name, ty, value, .. } => {
                 let val = self.gen_expr(value)?;
                 if let Some(annot) = ty {
-                    if Self::type_name(annot) != Self::type_name(&val.ty) {
+                    if type_name(annot) != type_name(&val.ty) {
                         return Err(format!(
                             "tipo anotado '{0}' não bate com o valor '{1}' (inferência real: F4)",
-                            Self::type_name(annot),
-                            Self::type_name(&val.ty)
+                            type_name(annot),
+                            type_name(&val.ty)
                         ));
                     }
                 }
@@ -381,11 +419,11 @@ impl<'ctx> Codegen<'ctx> {
                     Some(v) => {
                         let val = self.gen_expr(v)?;
                         if let Some(expected) = &self.current_ret {
-                            if Self::type_name(expected) != Self::type_name(&val.ty) {
+                            if type_name(expected) != type_name(&val.ty) {
                                 return Err(format!(
                                     "retorno '{}' não bate com o tipo declarado '{}'",
-                                    Self::type_name(&val.ty),
-                                    Self::type_name(expected)
+                                    type_name(&val.ty),
+                                    type_name(expected)
                                 ));
                             }
                         }
@@ -541,11 +579,11 @@ impl<'ctx> Codegen<'ctx> {
                 let val = self.gen_expr(value)?;
                 match self.gen_lvalue(target)? {
                     Some((tty, ptr)) => {
-                        if Self::type_name(&tty) != Self::type_name(&val.ty) {
+                        if type_name(&tty) != type_name(&val.ty) {
                             return Err(format!(
                                 "atribuição: alvo '{}' não aceita valor '{}'",
-                                Self::type_name(&tty),
-                                Self::type_name(&val.ty)
+                                type_name(&tty),
+                                type_name(&val.ty)
                             ));
                         }
                         self.builder
@@ -589,7 +627,7 @@ impl<'ctx> Codegen<'ctx> {
                 let Some((oty, optr)) = self.gen_lvalue(obj)? else {
                     return Ok(None);
                 };
-                let ty_name = Self::type_name(&oty);
+                let ty_name = type_name(&oty);
                 let (st, def) = match self.structs.get(&ty_name) {
                     Some(x) => x,
                     None => return Ok(None), // enum.field não é lvalue
@@ -610,12 +648,24 @@ impl<'ctx> Codegen<'ctx> {
 
     // ----------------------- expressões -------------------------------
 
-    fn gen_expr(&self, expr: &Expr) -> Result<Typed<'ctx>, String> {
+    fn gen_expr(&mut self, expr: &Expr) -> Result<Typed<'ctx>, String> {
         match expr {
-            Expr::Number(n, _) => Ok(Typed {
-                value: self.context.f64_type().const_float(*n).into(),
-                ty: Type::Named("float".into()),
+            Expr::Int(n, _) => Ok(Typed {
+                value: self.context.i64_type().const_int(*n as u64, true).into(),
+                ty: Type::Int,
             }),
+            Expr::Float(n, _) => Ok(Typed {
+                value: self.context.f64_type().const_float(*n).into(),
+                ty: Type::Float,
+            }),
+            Expr::Bool(b, _) => Ok(Typed {
+                value: self.context.bool_type().const_int(*b as u64, false).into(),
+                ty: Type::Bool,
+            }),
+            Expr::Str(s, _) => {
+                let ptr = self.intern_string(s)?;
+                Ok(Typed { value: ptr.into(), ty: Type::Str })
+            }
             Expr::Ident(name, _) => {
                 let (ty, ptr) = self
                     .vars
@@ -628,103 +678,40 @@ impl<'ctx> Codegen<'ctx> {
                     .map_err(|e| e.to_string())?;
                 Ok(Typed { value: v, ty: ty.clone() })
             }
-            Expr::Binary { op, lhs, rhs, .. } => {
-                use BinOp::*;
-                // Comparações e lógicos
-                let cmp = match op {
-                    Eq | Ne | Lt | Le | Gt | Ge => Some(*op),
-                    _ => None,
-                };
-                if let Some(cmp) = cmp {
-                    let l = self.gen_expr(lhs)?;
-                    let r = self.gen_expr(rhs)?;
-                    let l = self.as_float(&l, "operando esquerdo")?;
-                    let r = self.as_float(&r, "operando direito")?;
-                    let pred = match cmp {
-                        Eq => FloatPredicate::OEQ,
-                        Ne => FloatPredicate::ONE,
-                        Lt => FloatPredicate::OLT,
-                        Le => FloatPredicate::OLE,
-                        Gt => FloatPredicate::OGT,
-                        Ge => FloatPredicate::OGE,
-                        _ => unreachable!(),
-                    };
-                    let v = self
-                        .builder
-                        .build_float_compare(pred, l, r, "cmptmp")
-                        .map_err(|e| e.to_string())?;
-                    return Ok(Typed {
-                        value: v.into(),
-                        ty: Type::Named("bool".into()),
-                    });
-                }
-                match op {
-                    And | Or => {
-                        let l = self.gen_expr(lhs)?;
-                        let r = self.gen_expr(rhs)?;
-                        let l = self.as_bool(&l, "operando esquerdo")?;
-                        let r = self.as_bool(&r, "operando direito")?;
-                        // Sem curto-circuito (F5) — avalia ambos.
-                        let v = match op {
-                            And => self.builder.build_and(l, r, "andtmp"),
-                            Or => self.builder.build_or(l, r, "ortmp"),
-                            _ => unreachable!(),
-                        }
-                        .map_err(|e| e.to_string())?;
-                        Ok(Typed {
-                            value: v.into(),
-                            ty: Type::Named("bool".into()),
-                        })
-                    }
-                    _ => {
-                        let l = self.gen_expr(lhs)?;
-                        let r = self.gen_expr(rhs)?;
-                        let l = self.as_float(&l, "operando esquerdo")?;
-                        let r = self.as_float(&r, "operando direito")?;
-                        let result = match op {
-                            BinOp::Add => self.builder.build_float_add(l, r, "addtmp"),
-                            BinOp::Sub => self.builder.build_float_sub(l, r, "subtmp"),
-                            BinOp::Mul => self.builder.build_float_mul(l, r, "multmp"),
-                            BinOp::Div => self.builder.build_float_div(l, r, "divtmp"),
-                            _ => unreachable!(),
-                        }
-                        .map_err(|e| e.to_string())?;
-                        Ok(Typed {
-                            value: result.into(),
-                            ty: Type::Named("float".into()),
-                        })
-                    }
-                }
-            }
+            Expr::Binary { op, lhs, rhs, .. } => self.gen_binary(*op, lhs, rhs),
             Expr::StructLit { name, fields, .. } => {
                 let (st, def) = self
                     .structs
                     .get(name)
                     .ok_or_else(|| format!("struct '{name}' não declarada"))?;
+                let st = *st;
+                // Clona os campos: gen_expr precisa de &mut self.
+                let field_defs = def.fields.clone();
                 // Materializa num alloca temporário e carrega como valor.
                 let temp = self
                     .builder
-                    .build_alloca(*st, name)
+                    .build_alloca(st, name)
                     .map_err(|e| e.to_string())?;
-                let mut missing: Vec<&str> = def.fields.iter().map(|(n, _)| n.as_str()).collect();
+                let mut missing: Vec<String> =
+                    field_defs.iter().map(|(n, _)| n.clone()).collect();
                 for (fname, fexpr) in fields {
-                    let idx = def.index(fname).ok_or_else(|| {
-                        format!("struct '{name}' não tem campo '{fname}'")
-                    })?;
+                    let Some(idx) = field_defs.iter().position(|(n, _)| n == fname) else {
+                        return Err(format!("struct '{name}' não tem campo '{fname}'"));
+                    };
                     let v = self.gen_expr(fexpr)?;
                     let ptr = self
                         .builder
-                        .build_struct_gep(*st, temp, idx, "gep")
+                        .build_struct_gep(st, temp, idx as u32, "gep")
                         .map_err(|e| e.to_string())?;
                     self.builder.build_store(ptr, v.value).map_err(|e| e.to_string())?;
-                    missing.retain(|n| *n != fname);
+                    missing.retain(|n| n != fname);
                 }
                 if let Some(fname) = missing.first() {
                     return Err(format!("struct literal '{name}' sem o campo '{fname}'"));
                 }
                 let val = self
                     .builder
-                    .build_load(*st, temp, "structval")
+                    .build_load(st, temp, "structval")
                     .map_err(|e| e.to_string())?;
                 Ok(Typed { value: val, ty: Type::Named(name.clone()) })
             }
@@ -736,7 +723,7 @@ impl<'ctx> Codegen<'ctx> {
                             format!("enum '{enum_name}' não tem variante '{field}'")
                         })?;
                         return Ok(Typed {
-                            value: self.context.f64_type().const_float(*value).into(),
+                            value: self.context.i64_type().const_int(*value as u64, true).into(),
                             ty: Type::Named(enum_name.clone()),
                         });
                     }
@@ -744,7 +731,7 @@ impl<'ctx> Codegen<'ctx> {
                 // Struct member: se o obj é lvalue, GEP direto no ponteiro
                 // (mais eficiente que materializar temp).
                 if let Some((oty, optr)) = self.gen_lvalue(obj)? {
-                    let ty_name = Self::type_name(&oty);
+                    let ty_name = type_name(&oty);
                     let (st, def) = self
                         .structs
                         .get(&ty_name)
@@ -766,7 +753,7 @@ impl<'ctx> Codegen<'ctx> {
                 } else {
                     // Temporário: materializa num alloca e faz GEP.
                     let obj_v = self.gen_expr(obj)?;
-                    let ty_name = Self::type_name(&obj_v.ty);
+                    let ty_name = type_name(&obj_v.ty);
                     let (st, def) = self
                         .structs
                         .get(&ty_name)
@@ -801,15 +788,28 @@ impl<'ctx> Codegen<'ctx> {
             Expr::Unary { op, operand, .. } => match op {
                 UnOp::Neg => {
                     let v = self.gen_expr(operand)?;
-                    let v = self.as_float(&v, "operando")?;
-                    let r = self
-                        .builder
-                        .build_float_neg(v, "negtmp")
-                        .map_err(|e| e.to_string())?;
-                    Ok(Typed {
-                        value: r.into(),
-                        ty: Type::Named("float".into()),
-                    })
+                    match v.ty {
+                        Type::Float => {
+                            let f = self.as_float(&v, "operando")?;
+                            let r = self
+                                .builder
+                                .build_float_neg(f, "negtmp")
+                                .map_err(|e| e.to_string())?;
+                            Ok(Typed { value: r.into(), ty: Type::Float })
+                        }
+                        Type::Int => {
+                            let i = self.as_int(&v, "operando")?;
+                            let r = self
+                                .builder
+                                .build_int_neg(i, "negtmp")
+                                .map_err(|e| e.to_string())?;
+                            Ok(Typed { value: r.into(), ty: Type::Int })
+                        }
+                        other => Err(format!(
+                            "'-' exige int ou float, encontrou '{}'",
+                            type_name(&other)
+                        )),
+                    }
                 }
                 UnOp::Not => {
                     let v = self.gen_expr(operand)?;
@@ -820,20 +820,217 @@ impl<'ctx> Codegen<'ctx> {
                         .map_err(|e| e.to_string())?;
                     Ok(Typed {
                         value: r.into(),
-                        ty: Type::Named("bool".into()),
+                        ty: Type::Bool,
                     })
                 }
             },
-            Expr::Str(..) => {
-                Err("strings ainda não suportadas no codegen (F4)".into())
+            Expr::Cast { to, expr, .. } => {
+                let v = self.gen_expr(expr)?;
+                match (to, &v.ty) {
+                    (Type::Float, Type::Int) => {
+                        let f = self
+                            .builder
+                            .build_signed_int_to_float(v.value.into_int_value(), self.context.f64_type(), "itof")
+                            .map_err(|e| e.to_string())?;
+                        Ok(Typed { value: f.into(), ty: Type::Float })
+                    }
+                    (Type::Int, Type::Float) => {
+                        let i = self
+                            .builder
+                            .build_float_to_signed_int(v.value.into_float_value(), self.context.i64_type(), "ftoi")
+                            .map_err(|e| e.to_string())?;
+                        Ok(Typed { value: i.into(), ty: Type::Int })
+                    }
+                    (Type::Float, Type::Float) | (Type::Int, Type::Int) => Ok(v),
+                    (to, from) => Err(format!(
+                        "cast não suportado: '{}' → '{}'",
+                        type_name(from),
+                        type_name(to)
+                    )),
+                }
             }
         }
+    }
+
+    // ------------------- binários (tipos já unificados) -----------------
+
+    fn gen_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<Typed<'ctx>, String> {
+        use BinOp::*;
+        let l = self.gen_expr(lhs)?;
+        let r = self.gen_expr(rhs)?;
+        match op {
+            And | Or => {
+                let l = self.as_bool(&l, "operando esquerdo")?;
+                let r = self.as_bool(&r, "operando direito")?;
+                // Sem curto-circuito (F5) — avalia ambos.
+                let v = match op {
+                    And => self.builder.build_and(l, r, "andtmp"),
+                    Or => self.builder.build_or(l, r, "ortmp"),
+                    _ => unreachable!(),
+                }
+                .map_err(|e| e.to_string())?;
+                Ok(Typed { value: v.into(), ty: Type::Bool })
+            }
+            Eq | Ne => self.gen_equality(op, &l, &r),
+            Lt | Le | Gt | Ge => self.gen_relational(op, &l, &r),
+            Add | Sub | Mul | Div => self.gen_arith(op, &l, &r),
+        }
+    }
+
+    /// `==`/`!=`: float (fcmp), int (icmp), bool, string (ponteiro —
+    /// internada, então igualdade é identidade), enum (i64).
+    fn gen_equality(&mut self, op: BinOp, l: &Typed<'ctx>, r: &Typed<'ctx>) -> Result<Typed<'ctx>, String> {
+        let pred = match op {
+            BinOp::Eq => IntPredicate::EQ,
+            BinOp::Ne => IntPredicate::NE,
+            _ => unreachable!(),
+        };
+        let v = match &l.ty {
+            Type::Float => {
+                let l = self.as_float(l, "operando esquerdo")?;
+                let r = self.as_float(r, "operando direito")?;
+                let fp = if pred == IntPredicate::EQ { FloatPredicate::OEQ } else { FloatPredicate::ONE };
+                self.builder.build_float_compare(fp, l, r, "cmptmp")
+            }
+            Type::Int => self.builder.build_int_compare(
+                pred,
+                self.as_int(l, "operando esquerdo")?,
+                self.as_int(r, "operando direito")?,
+                "cmptmp",
+            ),
+            Type::Bool => self.builder.build_int_compare(
+                pred,
+                l.value.into_int_value(),
+                r.value.into_int_value(),
+                "cmptmp",
+            ),
+            // string: internada — igualdade vira comparação de ponteiro.
+            Type::Str => {
+                let i64_ty = self.context.i64_type();
+                let la = self
+                    .builder
+                    .build_ptr_to_int(l.value.into_pointer_value(), i64_ty, "straddr")
+                    .map_err(|e| e.to_string())?;
+                let ra = self
+                    .builder
+                    .build_ptr_to_int(r.value.into_pointer_value(), i64_ty, "straddr")
+                    .map_err(|e| e.to_string())?;
+                self.builder.build_int_compare(pred, la, ra, "cmptmp")
+            }
+            // enum: i64.
+            Type::Named(_) => self.builder.build_int_compare(
+                pred,
+                l.value.into_int_value(),
+                r.value.into_int_value(),
+                "cmptmp",
+            ),
+            other => {
+                return Err(format!(
+                    "'{}' não suporta comparação (checker deveria ter pego)",
+                    type_name(other)
+                ))
+            }
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(Typed { value: v.into(), ty: Type::Bool })
+    }
+
+    /// `< <= > >=`: int (icmp com sinal) ou float (fcmp).
+    fn gen_relational(&mut self, op: BinOp, l: &Typed<'ctx>, r: &Typed<'ctx>) -> Result<Typed<'ctx>, String> {
+        let v = match &l.ty {
+            Type::Float => {
+                let l = self.as_float(l, "operando esquerdo")?;
+                let r = self.as_float(r, "operando direito")?;
+                let fp = match op {
+                    BinOp::Lt => FloatPredicate::OLT,
+                    BinOp::Le => FloatPredicate::OLE,
+                    BinOp::Gt => FloatPredicate::OGT,
+                    BinOp::Ge => FloatPredicate::OGE,
+                    _ => unreachable!(),
+                };
+                self.builder.build_float_compare(fp, l, r, "cmptmp")
+            }
+            Type::Int => {
+                let l = self.as_int(l, "operando esquerdo")?;
+                let r = self.as_int(r, "operando direito")?;
+                let ip = match op {
+                    BinOp::Lt => IntPredicate::SLT,
+                    BinOp::Le => IntPredicate::SLE,
+                    BinOp::Gt => IntPredicate::SGT,
+                    BinOp::Ge => IntPredicate::SGE,
+                    _ => unreachable!(),
+                };
+                self.builder.build_int_compare(ip, l, r, "cmptmp")
+            }
+            other => {
+                return Err(format!(
+                    "'{}' não suporta comparação relacional (checker deveria ter pego)",
+                    type_name(other)
+                ))
+            }
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(Typed { value: v.into(), ty: Type::Bool })
+    }
+
+    /// `+ - * /`: int usa i64 (divisão sdiv trunca para zero, como Go);
+    /// float usa f64. Tipos já unificados pelo checker.
+    fn gen_arith(&mut self, op: BinOp, l: &Typed<'ctx>, r: &Typed<'ctx>) -> Result<Typed<'ctx>, String> {
+        match &l.ty {
+            Type::Float => {
+                let l = self.as_float(l, "operando esquerdo")?;
+                let r = self.as_float(r, "operando direito")?;
+                let f = match op {
+                    BinOp::Add => self.builder.build_float_add(l, r, "addtmp"),
+                    BinOp::Sub => self.builder.build_float_sub(l, r, "subtmp"),
+                    BinOp::Mul => self.builder.build_float_mul(l, r, "multmp"),
+                    BinOp::Div => self.builder.build_float_div(l, r, "divtmp"),
+                    _ => unreachable!(),
+                }
+                .map_err(|e| e.to_string())?;
+                Ok(Typed { value: f.into(), ty: Type::Float })
+            }
+            Type::Int => {
+                let l = self.as_int(l, "operando esquerdo")?;
+                let r = self.as_int(r, "operando direito")?;
+                // sdiv: trunca para zero (Go) — não é floor.
+                let i = match op {
+                    BinOp::Add => self.builder.build_int_add(l, r, "addtmp"),
+                    BinOp::Sub => self.builder.build_int_sub(l, r, "subtmp"),
+                    BinOp::Mul => self.builder.build_int_mul(l, r, "multmp"),
+                    BinOp::Div => self.builder.build_int_signed_div(l, r, "divtmp"),
+                    _ => unreachable!(),
+                }
+                .map_err(|e| e.to_string())?;
+                Ok(Typed { value: i.into(), ty: Type::Int })
+            }
+            other => Err(format!(
+                "'{}' não suporta aritmética (checker deveria ter pego)",
+                type_name(other)
+            )),
+        }
+    }
+
+    /// Interna uma string literal: uma global constante por conteúdo
+    /// (tabela por módulo). `==`/`!=` entre strings vira comparação de
+    /// ponteiro — correta porque literais iguais compartilham a global.
+    fn intern_string(&mut self, s: &str) -> Result<PointerValue<'ctx>, String> {
+        if let Some(p) = self.strings.get(s) {
+            return Ok(*p);
+        }
+        let g = self
+            .builder
+            .build_global_string_ptr(s, "str")
+            .map_err(|e| e.to_string())?;
+        let ptr = g.as_pointer_value();
+        self.strings.insert(s.to_string(), ptr);
+        Ok(ptr)
     }
 
     /// Resolve o alvo de uma chamada (método ou função de módulo)
     /// e avalia os argumentos. Retorna função, args e símbolo.
     fn resolve_call(
-        &self,
+        &mut self,
         callee: &Expr,
         args: &[Expr],
     ) -> Result<(FunctionValue<'ctx>, Vec<BasicMetadataValueEnum<'ctx>>, String), String> {
@@ -842,7 +1039,7 @@ impl<'ctx> Codegen<'ctx> {
             let (oty, optr) = self.gen_lvalue(obj)?.ok_or_else(|| {
                 "método exige uma variável (receiver por referência) — atribua o valor a uma variável primeiro".to_string()
             })?;
-            let ty_name = Self::type_name(&oty);
+            let ty_name = type_name(&oty);
             if !self.structs.contains_key(&ty_name) {
                 return Err(format!(
                     "método exige receiver struct, encontrou '{ty_name}'"
@@ -893,7 +1090,7 @@ impl<'ctx> Codegen<'ctx> {
                     .ret_types
                     .get(symbol)
                     .and_then(|t| t.clone())
-                    .unwrap_or_else(|| Type::Named("float".into()));
+                    .unwrap_or_else(|| Type::Float);
                 Ok(Typed { value: v, ty: ret_ty })
             }
             None => Err(format!(
@@ -904,37 +1101,31 @@ impl<'ctx> Codegen<'ctx> {
 
     /// Extrai IntValue (i1) de um bool, com erro claro.
     fn as_bool(&self, t: &Typed<'ctx>, what: &str) -> Result<IntValue<'ctx>, String> {
-        if !matches!(t.ty, Type::Named(ref n) if n == "bool") {
+        if t.ty != Type::Bool {
             return Err(format!(
                 "'{what}' deve ser bool, encontrou '{}'",
-                Self::type_name(&t.ty)
+                type_name(&t.ty)
             ));
         }
         Ok(t.value.into_int_value())
     }
 
-    /// Avalia uma condição de if/for: bool direto, ou numérico != 0.
-    fn gen_cond(&self, expr: &Expr) -> Result<IntValue<'ctx>, String> {
+    /// Avalia uma condição de if/for: bool (F4 — sem truthiness).
+    fn gen_cond(&mut self, expr: &Expr) -> Result<IntValue<'ctx>, String> {
         let t = self.gen_expr(expr)?;
-        let tn = Self::type_name(&t.ty);
-        if tn == "bool" {
+        if t.ty == Type::Bool {
             return Ok(t.value.into_int_value());
         }
-        if Self::is_float(&t.ty) || self.enums.contains_key(&tn) {
-            let v = t.value.into_float_value();
-            let zero = self.context.f64_type().const_float(0.0);
-            return self
-                .builder
-                .build_float_compare(FloatPredicate::ONE, v, zero, "cond")
-                .map_err(|e| e.to_string());
-        }
-        Err(format!("condição deve ser bool ou numérica, encontrou '{tn}'"))
+        Err(format!(
+            "condição deve ser bool, encontrou '{}'",
+            type_name(&t.ty)
+        ))
     }
 
     // ======================== execução JIT ============================
 
-    /// Roda o módulo via JIT e executa `main`, retornando o valor se float.
-    pub fn run_main(&self) -> Result<Option<f64>, String> {
+    /// Roda o módulo via JIT e executa `main` (float, int ou void).
+    pub fn run_main(&self) -> Result<MainResult, String> {
         let engine = self
             .module
             .create_jit_execution_engine(OptimizationLevel::None)
@@ -945,12 +1136,19 @@ impl<'ctx> Codegen<'ctx> {
             .ok_or("função 'main' não encontrada no programa")?;
 
         match self.ret_types.get("main").cloned().flatten() {
-            Some(Type::Named(n)) if n == "float" => {
+            Some(Type::Float) => {
                 type MainF = unsafe extern "C" fn() -> f64;
                 // SAFETY: main foi gerada por nós com assinatura compatível.
                 let f: JitFunction<MainF> =
                     unsafe { engine.get_function("main") }.map_err(|e| e.to_string())?;
-                unsafe { Ok(Some(f.call())) }
+                unsafe { Ok(MainResult::Float(f.call())) }
+            }
+            Some(Type::Int) => {
+                type MainI = unsafe extern "C" fn() -> i64;
+                // SAFETY: idem.
+                let f: JitFunction<MainI> =
+                    unsafe { engine.get_function("main") }.map_err(|e| e.to_string())?;
+                unsafe { Ok(MainResult::Int(f.call())) }
             }
             None => {
                 type MainV = unsafe extern "C" fn();
@@ -959,11 +1157,11 @@ impl<'ctx> Codegen<'ctx> {
                 unsafe {
                     f.call();
                 }
-                Ok(None)
+                Ok(MainResult::Void)
             }
             Some(other) => Err(format!(
-                "main deve retornar float ou void, encontrou '{}'",
-                Self::type_name(&other)
+                "main deve retornar float, int ou void, encontrou '{}'",
+                type_name(&other)
             )),
         }
     }
@@ -971,6 +1169,8 @@ impl<'ctx> Codegen<'ctx> {
     // =========================== F1: expressão ========================
 
     /// Compila uma expressão como corpo de `top() -> f64` (caminho F1).
+    /// int é promovido para float na saída (sitofp); string/bool/struct
+    /// não têm representação em `top`.
     pub fn compile_top(&mut self, expr: &Expr) -> Result<(), String> {
         let f64_ty = self.context.f64_type();
         let fn_ty = f64_ty.fn_type(&[], false);
@@ -978,7 +1178,23 @@ impl<'ctx> Codegen<'ctx> {
         let entry = self.context.append_basic_block(function, "entry");
         self.builder.position_at_end(entry);
         let value = self.gen_expr(expr)?;
-        let value = self.as_float(&value, "expressão")?;
+        let value = match value.ty {
+            Type::Float => self.as_float(&value, "expressão")?,
+            Type::Int => self
+                .builder
+                .build_signed_int_to_float(
+                    self.as_int(&value, "expressão")?,
+                    f64_ty,
+                    "itof",
+                )
+                .map_err(|e| e.to_string())?,
+            other => {
+                return Err(format!(
+                    "expressão deve ser int ou float, encontrou '{}'",
+                    type_name(&other)
+                ))
+            }
+        };
         self.builder.build_return(Some(&value)).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -1008,26 +1224,35 @@ mod tests {
         let context = Context::create();
         let mut cg = Codegen::new(&context);
         let expr = parse_expr(src).unwrap();
+        let expr = crate::checker::check_expr(&expr).unwrap();
         cg.compile_top(&expr).unwrap();
         cg.run_jit().unwrap()
     }
 
     #[test]
     fn jit_executes_arithmetic() {
-        assert_eq!(eval("1 + 2"), 3.0);
-        assert_eq!(eval("1 + 2 * 3"), 7.0);
+        assert_eq!(eval("1.0 + 2.0"), 3.0);
+        assert_eq!(eval("1 + 2"), 3.0); // int promovido na saída
+        assert_eq!(eval("1.0 + 2.0 * 3.0"), 7.0);
         assert_eq!(eval("(1 + 2) * 3"), 9.0);
-        assert_eq!(eval("10 / 4"), 2.5);
+        assert_eq!(eval("10.0 / 4.0"), 2.5);
+        assert_eq!(eval("10 / 4"), 2.0); // divisão de int trunca
+        assert_eq!(eval("1 + 2.5"), 3.5); // int promovido no binário
     }
 
     // ---- caminho F2b (programa com main) ----
 
     fn eval_program(src: &str) -> Result<Option<f64>, String> {
         let program = parse_program(src).map_err(|e| e.to_string())?;
+        let program = crate::checker::check_program(&program).map_err(|e| e.to_string())?;
         let context = Context::create();
         let mut cg = Codegen::new(&context);
         cg.compile_program(&program)?;
-        cg.run_main()
+        match cg.run_main()? {
+            MainResult::Float(f) => Ok(Some(f)),
+            MainResult::Int(i) => Ok(Some(i as f64)),
+            MainResult::Void => Ok(None),
+        }
     }
 
     fn eval_main(src: &str) -> f64 {
@@ -1104,8 +1329,8 @@ mod tests {
 
     #[test]
     fn unknown_type_is_error() {
-        let src = "func main(): int { return 1; }";
-        assert!(eval_program(src).unwrap_err().contains("int"));
+        let src = "func main(): banana { return 1.0; }";
+        assert!(eval_program(src).unwrap_err().contains("banana"));
     }
 
     // ---- caminho F2c (structs, receiver, métodos) ----
@@ -1259,11 +1484,13 @@ mod tests {
                 let c = Citizen { mood: Mood.Happy };
                 c.set_mood(Mood.Stressed);
                 c.mood = Mood.Neutral;
-                return c.mood + 1.0;
+                if c.mood == Mood.Neutral {
+                    return 1.0;
+                }
+                return 0.0;
             }
         "#;
-        // Neutral = 1.0, então 1.0 + 1.0 = 2.0
-        assert_eq!(eval_main(src), 2.0);
+        assert_eq!(eval_main(src), 1.0);
     }
 
     #[test]
@@ -1554,5 +1781,201 @@ mod tests {
         "#;
         // pos.x = 0 + (100-0)*0.5 = 50; pos.y = 0
         assert_eq!(eval_main(src), 50.0);
+    }
+
+    // ---- F4: int/float, bool, strings, casts ----
+
+    #[test]
+    fn int_arithmetic_and_division_truncates() {
+        let src = "func main(): int { return 1 + 2 * 3; }";
+        assert_eq!(eval_main(src), 7.0);
+        let src = "func main(): int { return 7 / 2; }";
+        assert_eq!(eval_main(src), 3.0); // sdiv trunca
+        let src = "func main(): int { return -7 / 2; }";
+        assert_eq!(eval_main(src), -3.0); // trunca para zero (Go)
+        let src = "func main(): int { return -3 + 10; }";
+        assert_eq!(eval_main(src), 7.0);
+    }
+
+    #[test]
+    fn int_annotated_let_and_int_comparisons() {
+        let src = r#"
+            func main(): int {
+                let x: int = 5;
+                let y = 3;
+                if x > y && y >= 3 && x != y {
+                    return x - y;
+                }
+                return 0;
+            }
+        "#;
+        assert_eq!(eval_main(src), 2.0);
+    }
+
+    #[test]
+    fn implicit_int_to_float_coercion() {
+        // chamada, let anotado e binário misto
+        let src = r#"
+            func add(a: float, b: float): float { return a + b; }
+            func main(): float {
+                let x: float = 1;
+                let y = 2.5 + 1;
+                return add(1, 2) + x + y;
+            }
+        "#;
+        assert_eq!(eval_main(src), 7.5); // 3.0 + 1.0 + 3.5
+    }
+
+    #[test]
+    fn explicit_cast_float_to_int_truncates() {
+        let src = "func main(): int { return int(3.9); }";
+        assert_eq!(eval_main(src), 3.0);
+        let src = "func main(): int { return int(-3.9); }";
+        assert_eq!(eval_main(src), -3.0);
+        let src = "func main(): float { return float(3); }";
+        assert_eq!(eval_main(src), 3.0);
+    }
+
+    #[test]
+    fn float_to_int_without_cast_is_error() {
+        let src = "func main(): int { let x = 1.5; return x; }";
+        assert!(eval_program(src).unwrap_err().contains("cast"));
+        let src = "func main(): float { let x: int = 1.5; return 1.0; }";
+        assert!(eval_program(src).unwrap_err().contains("int(x)"));
+    }
+
+    #[test]
+    fn bool_literals_and_logic() {
+        let src = r#"
+            func main(): float {
+                let flag = true;
+                if flag && !false && (3 > 2) {
+                    return 1.0;
+                }
+                return 0.0;
+            }
+        "#;
+        assert_eq!(eval_main(src), 1.0);
+    }
+
+    #[test]
+    fn bool_equality() {
+        let src = r#"
+            func main(): float {
+                if true == true && false != true {
+                    return 1.0;
+                }
+                return 0.0;
+            }
+        "#;
+        assert_eq!(eval_main(src), 1.0);
+    }
+
+    #[test]
+    fn mixed_int_float_comparison() {
+        let src = r#"
+            func main(): float {
+                if 1 < 2.5 {
+                    return 1.0;
+                }
+                return 0.0;
+            }
+        "#;
+        assert_eq!(eval_main(src), 1.0);
+    }
+
+    #[test]
+    fn string_equality_uses_interning() {
+        let src = r#"
+            func main(): float {
+                let a = "hello";
+                let b = "hello";
+                let c = "world";
+                if a == b && a != c && "hello" == a {
+                    return 1.0;
+                }
+                return 0.0;
+            }
+        "#;
+        assert_eq!(eval_main(src), 1.0);
+    }
+
+    #[test]
+    fn strings_in_params_and_returns() {
+        let src = r#"
+            func greet(name: string): string {
+                return name;
+            }
+            func main(): float {
+                let s = greet("forge");
+                if s == "forge" && greet("a") != greet("b") {
+                    return 1.0;
+                }
+                return 0.0;
+            }
+        "#;
+        assert_eq!(eval_main(src), 1.0);
+    }
+
+    #[test]
+    fn string_in_struct_and_condition_must_be_bool() {
+        let src = r#"
+            struct Person {
+                name: string;
+                age: int;
+            }
+            func main(): float {
+                let p = Person { name: "ada", age: 36 };
+                if p.name == "ada" && p.age >= 30 {
+                    return 1.0;
+                }
+                return 0.0;
+            }
+        "#;
+        assert_eq!(eval_main(src), 1.0);
+        // condição não-bool agora é erro de tipo
+        let src = "func main(): float { let x = 1.0; if x { return 1.0; } return 0.0; }";
+        assert!(eval_program(src).unwrap_err().contains("bool"));
+    }
+
+    #[test]
+    fn int_main_executes() {
+        let src = "func main(): int { return 42; }";
+        let result = eval_program(src).unwrap();
+        assert_eq!(result, Some(42.0));
+    }
+
+    #[test]
+    fn enum_as_int_and_comparison() {
+        let src = r#"
+            enum Level { Low, Mid, High }
+            func main(): int {
+                let l = Level.High;
+                if l == Level.High {
+                    return 1;
+                }
+                return 0;
+            }
+        "#;
+        assert_eq!(eval_main(src), 1.0);
+    }
+
+    #[test]
+    fn checker_rejects_bad_programs() {
+        // string + string
+        let src = r#"func main(): float { let s = "a" + "b"; return 1.0; }"#;
+        assert!(eval_program(src).is_err());
+        // return sem valor em função não-void
+        let src = "func main(): float { return; }";
+        assert!(eval_program(src).is_err());
+        // void com return de valor
+        let src = "func main() { return 1.0; }";
+        assert!(eval_program(src).is_err());
+        // aridade errada
+        let src = "func f(a: float) { } func main() { f(1.0, 2.0); }";
+        assert!(eval_program(src).is_err());
+        // variável fora do escopo do bloco
+        let src = "func main(): float { if true { let x = 1.0; } return x; }";
+        assert!(eval_program(src).is_err());
     }
 }

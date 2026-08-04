@@ -3,18 +3,43 @@
 //! Dois andares:
 //!   Program (declarações top-level) → Decl → ... → Stmt → Expr
 //!
-//! O type checker (F4) vai consumir este mesmo AST e produzir
-//! uma versão "tipada" que o codegen entende.
+//! O type checker (F4) consome este AST e produz uma versão "tipada":
+//! a mesma árvore com `Cast` inseridos para coerção int→float.
 
 use crate::lexer::Span;
 
 // ============================= Tipos =================================
 
-/// Tipos da linguagem. Hoje: apenas tipos nomeados (float, City, Vec2...).
-/// F4 adiciona: genéricos, arrays, optionals.
+/// Tipos da linguagem.
+///
+/// F4: primitivos `int`/`float`/`bool`/`string`/`void` + tipos nomeados
+/// (structs e enums). F5 adiciona: genéricos, arrays, optionals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
+    /// Inteiro com sinal (i64 internamente). `42` — divisão trunca (Go).
+    Int,
+    /// Ponto flutuante (f64). `42.0`, `3.14`.
+    Float,
+    /// `true`/`false` (i1 internamente).
+    Bool,
+    /// String literal internada (ponteiro para global única por conteúdo).
+    Str,
+    /// Sem valor — só em posição de retorno de função.
+    Void,
+    /// Struct ou enum declarado no programa.
     Named(String),
+}
+
+/// Nome canônico de um tipo para mensagens de erro e formatação.
+pub fn type_name(ty: &Type) -> String {
+    match ty {
+        Type::Int => "int".into(),
+        Type::Float => "float".into(),
+        Type::Bool => "bool".into(),
+        Type::Str => "string".into(),
+        Type::Void => "void".into(),
+        Type::Named(name) => name.clone(),
+    }
 }
 
 // ========================== Declarações ==============================
@@ -164,7 +189,12 @@ pub enum UnOp {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    Number(f64, Span),
+    /// Inteiro literal: `42`.
+    Int(i64, Span),
+    /// Float literal: `42.0`, `3.14`.
+    Float(f64, Span),
+    /// `true` / `false`.
+    Bool(bool, Span),
     Str(String, Span),
     Ident(String, Span),
     Binary {
@@ -197,6 +227,14 @@ pub enum Expr {
         operand: Box<Expr>,
         span: Span,
     },
+    /// Cast explícito (`int(x)`, `float(x)`) — inserido pelo type checker
+    /// para coerção int→float implícita, ou escrito pelo usuário para
+    /// float→int (o único caminho, como em Go).
+    Cast {
+        to: Type,
+        expr: Box<Expr>,
+        span: Span,
+    },
 }
 
 // `Expr::span` será usado pelo codegen/erros nas próximas fases.
@@ -204,14 +242,17 @@ pub enum Expr {
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
-            Expr::Number(_, s)
+            Expr::Int(_, s)
+            | Expr::Float(_, s)
+            | Expr::Bool(_, s)
             | Expr::Str(_, s)
             | Expr::Ident(_, s) => *s,
             Expr::Binary { span, .. }
             | Expr::Call { span, .. }
             | Expr::Member { span, .. }
             | Expr::StructLit { span, .. }
-            | Expr::Unary { span, .. } => *span,
+            | Expr::Unary { span, .. }
+            | Expr::Cast { span, .. } => *span,
         }
     }
 }

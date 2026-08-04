@@ -54,7 +54,10 @@ impl Span {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
-    Number(f64),
+    /// Inteiro literal: `42` (F4: separado de float, como em Go).
+    IntLit(i64),
+    /// Float literal: `3.14`, `42.0`, `.5`.
+    FloatLit(f64),
     /// Identificador (inclui `self`, que é convenção, não keyword).
     Ident(String),
     /// String literal: "engine"
@@ -275,7 +278,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                 i += 1;
                 col += 1;
             }
-            // Número: "42", "3.14", ".5" — mas "." sozinho é member access.
+            // Número: "42" (int), "3.14"/"42.0"/".5" (float) — mas "."
+            // sozinho é member access. F4: int e float são separados (Go).
             '0'..='9' | '.'
                 if c.is_ascii_digit()
                     || chars.get(i + 1).is_some_and(|n| n.is_ascii_digit()) =>
@@ -292,13 +296,25 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                     col += 1;
                 }
                 let text: String = chars[start..i].iter().collect();
-                match text.parse::<f64>() {
-                    Ok(n) => push!(TokenKind::Number(n), span),
-                    Err(_) => {
-                        return Err(LexError {
-                            msg: format!("numero invalido: '{text}'"),
-                            span,
-                        })
+                if seen_dot {
+                    match text.parse::<f64>() {
+                        Ok(n) => push!(TokenKind::FloatLit(n), span),
+                        Err(_) => {
+                            return Err(LexError {
+                                msg: format!("numero invalido: '{text}'"),
+                                span,
+                            })
+                        }
+                    }
+                } else {
+                    match text.parse::<i64>() {
+                        Ok(n) => push!(TokenKind::IntLit(n), span),
+                        Err(_) => {
+                            return Err(LexError {
+                                msg: format!("numero invalido: '{text}'"),
+                                span,
+                            })
+                        }
                     }
                 }
             }
@@ -364,18 +380,27 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                TokenKind::Number(1.0),
+                TokenKind::IntLit(1),
                 TokenKind::Plus,
-                TokenKind::Number(2.0),
+                TokenKind::IntLit(2),
                 TokenKind::Star,
                 TokenKind::LParen,
-                TokenKind::Number(3.0),
+                TokenKind::IntLit(3),
                 TokenKind::Minus,
-                TokenKind::Number(4.0),
+                TokenKind::IntLit(4),
                 TokenKind::RParen,
                 TokenKind::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn lex_int_vs_float() {
+        let tokens = lex("42 3.14 .5 42.0").unwrap();
+        assert!(matches!(tokens[0].kind, TokenKind::IntLit(42)));
+        assert!(matches!(tokens[1].kind, TokenKind::FloatLit(f) if (f - 3.14).abs() < 1e-9));
+        assert!(matches!(tokens[2].kind, TokenKind::FloatLit(f) if (f - 0.5).abs() < 1e-9));
+        assert!(matches!(tokens[3].kind, TokenKind::FloatLit(f) if f == 42.0));
     }
 
     #[test]
@@ -398,7 +423,7 @@ mod tests {
     fn lex_skips_line_comments() {
         let tokens = lex("1 + // comentario\n2").unwrap();
         let kinds: Vec<TokenKind> = tokens.iter().map(|t| t.kind.clone()).collect();
-        assert_eq!(kinds, vec![TokenKind::Number(1.0), TokenKind::Plus, TokenKind::Number(2.0), TokenKind::Eof]);
+        assert_eq!(kinds, vec![TokenKind::IntLit(1), TokenKind::Plus, TokenKind::IntLit(2), TokenKind::Eof]);
     }
 
     #[test]

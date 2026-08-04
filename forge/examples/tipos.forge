@@ -1,0 +1,42 @@
+// F4: type checker + strings — int/float separados (Go), coerção
+// assimétrica e strings internadas.
+//
+//   int:     42          — i64, divisão trunca (7 / 2 = 3)
+//   float:   42.0, 3.14  — f64
+//   bool:    true/false
+//   string:  "olá"       — internada: == compara ponteiro
+//
+// int→float é automático; float→int exige int(x) — como em Go.
+
+struct Personagem {
+    nome: string;
+    vida: int;
+    velocidade: float;
+}
+
+func (p: Personagem) dano(d: int) {
+    p.vida = p.vida - d;
+    if p.vida <= 0 {
+        p.vida = 0;
+    }
+}
+
+func saudar(nome: string): string {
+    return nome;
+}
+
+func main(): int {
+    let hp_max = 100;
+    let heroi = Personagem { nome: "ada", vida: hp_max, velocidade: 1.5 };
+
+    heroi.dano(30);          // int para int: vida = 70
+    heroi.dano(int(2.9));    // cast explícito: 2 (trunca) → vida = 68
+
+    // int→float implícito em binário misto: 1.5 * 100 → 150.0
+    let tempo = heroi.velocidade * hp_max;
+
+    if heroi.vida == 68 && saudar("x") == "x" && tempo > 100.0 {
+        return heroi.vida;
+    }
+    return 0;
+}
